@@ -42,7 +42,6 @@ logger = logging.getLogger(__name__)
 import warnings
 warnings.filterwarnings("ignore", message="An issue occurred while importing 'torch-spline-conv'")
 warnings.filterwarnings("ignore", message="An issue occurred while importing 'torch-sparse'")
-warnings.filterwarnings("error", message="Token indices sequence length is longer than the specified maximum sequence length*")
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -604,8 +603,7 @@ def main():
                         help="The output directory where the model predictions and checkpoints will be written.")
     # parser.add_argument("--pretrained_model",type=str,default="microsoft/graphcodebert-base")
     # parser.add_argument("--pretrained_model",type=str,default="microsoft/unixcoder-base")
-    # parser.add_argument("--pretrained_model",type=str,default="microsoft/unixcoder-base-nine")
-    parser.add_argument("--pretrained_model",type=str,default="Salesforce/codet5p-770m")
+    parser.add_argument("--pretrained_model",type=str,default="microsoft/unixcoder-base-nine")
     
     parser.add_argument("--hidden_dim", type=int, default=384)
     parser.add_argument("--num_layers", type=int, default=3)
@@ -700,9 +698,36 @@ def main():
     exp_tag = f"A1{args.use_A1}_A2{args.use_A2}_A3{args.use_A3}"
     logger.info(f"Graph ablation setting: {exp_tag}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-    base_model = AutoModel.from_pretrained(args.pretrained_model,trust_remote_code=True)
-    word_embeddings = base_model.get_input_embeddings().weight.data.cpu().numpy()
+    from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.pretrained_model,
+        trust_remote_code=True,     
+        use_fast=True
+    )
+
+    try:
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.pretrained_model,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+    except Exception:
+        base_model = AutoModel.from_pretrained(
+            args.pretrained_model,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True
+        )
+
+    # 关键：确保 pad_token 可用（很多 CausalLM tokenizer 没有 pad）
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            tokenizer.add_special_tokens({"pad_token": "<pad>"})
+            base_model.resize_token_embeddings(len(tokenizer))
+
+    word_embeddings = base_model.get_input_embeddings().weight.detach().cpu().numpy()
     hidden_dim = word_embeddings.shape[1]
     del base_model
     torch.cuda.empty_cache()
