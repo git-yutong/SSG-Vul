@@ -17,6 +17,110 @@ from tqdm import tqdm
 import math
 
 
+import re
+
+KEYWORDS = {
+    "if","for","while","switch","case","return",
+    "int","char","void","long","short","float","double",
+    "static","const","unsigned","signed","struct",
+    "class","public","private","protected","try","catch","throw","new",
+    "true","false","null","nullptr",
+}
+
+def is_identifier_like(s: str) -> bool:
+    if not s:
+        return False
+    # 必须含字母或下划线开头（可按语言微调）
+    if not re.match(r"^[A-Za-z_]\w*$", s):
+        return False
+    if s in KEYWORDS:
+        return False
+    return True
+
+def clean_roberta_token(tok: str) -> str:
+    # UniXcoder/Roberta 常见：Ġ 表示词边界
+    return tok.replace("Ġ", "")
+
+LOW_INFO_IDENTIFIERS = {
+    "i", "j", "k", "n", "m",
+    "len", "length", "size",
+    "tmp", "temp",
+    "data", "buf", "buffer",
+    "ret", "res", "result",
+    "val", "value",
+    "idx", "index",
+}
+
+
+def strip_comments_keep_lines(code: str) -> str:
+    """
+    移除 // 与 /* */ 注释，但保持：
+      - 行数不变（换行保留）
+      - 尽量保持列位置（用空格替换注释内容）
+    目的：减少注释 token 噪声，同时不破坏 flaw_line_index / valid_mask 的行号对齐。
+    """
+    if not isinstance(code, str):
+        code = str(code)
+
+    out_lines = []
+    in_block = False
+
+    for line in code.split("\n"):
+        s = line
+        i = 0
+        res = []
+        while i < len(s):
+            if in_block:
+                end = s.find("*/", i)
+                if end == -1:
+                    # 整行都在块注释里 -> 全空格
+                    res.append(" " * (len(s) - i))
+                    i = len(s)
+                else:
+                    # 注释结束前替换为空格，跳过 */
+                    res.append(" " * (end + 2 - i))
+                    i = end + 2
+                    in_block = False
+            else:
+                # 查找 // 与 /* 的最早出现
+                idx_line = s.find("//", i)
+                idx_blk = s.find("/*", i)
+
+                if idx_line == -1 and idx_blk == -1:
+                    res.append(s[i:])
+                    break
+
+                # 取最近的注释起点
+                nxt = min([x for x in [idx_line, idx_blk] if x != -1])
+
+                if nxt > i:
+                    res.append(s[i:nxt])
+                    i = nxt
+
+                # 处理 // 注释
+                if idx_line != -1 and nxt == idx_line:
+                    # 从 // 到行末替换为空格
+                    res.append(" " * (len(s) - i))
+                    i = len(s)
+                    break
+
+                # 处理 /* */ 注释
+                if idx_blk != -1 and nxt == idx_blk:
+                    end = s.find("*/", i + 2)
+                    if end == -1:
+                        # 从 /* 到行末替换为空格，并进入块注释状态
+                        res.append(" " * (len(s) - i))
+                        i = len(s)
+                        in_block = True
+                    else:
+                        # 同行闭合：替换这段为空格
+                        res.append(" " * (end + 2 - i))
+                        i = end + 2
+
+        out_lines.append("".join(res))
+
+    return "\n".join(out_lines)
+
 def is_empty_flaw(s):
     if pd.isna(s):
         return True
@@ -27,6 +131,417 @@ def is_empty_flaw(s):
     if isinstance(s, str):
         return len(s.strip()) == 0
     return True
+def tokenize_func_into_segments(
+    func,
+    tokenizer,
+    block_size=512,
+    seg_num=4,
+):
+    """
+    把一个函数按行切开并 tokenize，切成最多 seg_num 段。
+    关键约束：**不要在某一行中间切**。
+
+    做法：
+      1. 先得到 code_tokens 和 row_idx（每个 token 对应的全局行号 1..num_lines）
+      2. 每段最多 block_size-2 个 code token（留 CLS/SEP）
+      3. 如果切点落在一行中间，就把这一整行挪到下一段：
+         => 当前段的 end_idx = 这一行的起始 token 下标（类似你 StagedVul 里的逻辑）
+
+    返回：
+        seg_input_ids_list : List[List[int]]，每段长度 = block_size
+        seg_line_ids_list  : List[List[int]]，同样长度，0=CLS/SEP/PAD，其它=全局行号(1..num_lines)
+        num_lines          : 原始函数总行数
+    """
+    rows = str(func).split("\n")
+    rows = ["\n" if x == "" else x for x in rows]
+    num_lines = len(rows) if len(rows) > 0 else 1
+
+    # 逐行 tokenize
+    row_tokens = [tokenizer.tokenize(x) for x in rows]
+
+    code_tokens = []
+    row_idx = []  # 和 StagedVul 一样：每个 token 对应的行号（1..num_lines）
+    for i, toks in enumerate(row_tokens):
+        line_no = i + 1
+        for _t in toks:
+            code_tokens.append(_t)
+            row_idx.append(line_no)
+
+    # 没有任何 token，返回一个空段（基本不会发生）
+    if len(code_tokens) == 0:
+        pad_id = tokenizer.pad_token_id
+        seg_input_ids = [tokenizer.cls_token, tokenizer.sep_token]
+        seg_line_ids = [0, 0]
+        # padding 到 block_size
+        if len(seg_input_ids) < block_size:
+            pad_len = block_size - len(seg_input_ids)
+            seg_input_ids += [pad_id] * pad_len
+            seg_line_ids += [0] * pad_len
+        else:
+            seg_input_ids = seg_input_ids[:block_size]
+            seg_line_ids = seg_line_ids[:block_size]
+
+        return [tokenizer.convert_tokens_to_ids(seg_input_ids)], [seg_line_ids], num_lines
+
+    max_code_per_seg = block_size - 2  # 每段能容纳的 code token 数
+    seg_input_ids_list = []
+    seg_line_ids_list = []
+    pad_id = tokenizer.pad_token_id
+
+    start_idx = 0
+    total_tokens = len(code_tokens)
+
+    for _seg in range(seg_num):
+        if start_idx >= total_tokens:
+            break
+
+        # 先假设这一段拿 max_code_per_seg 个 token
+        tentative_end = start_idx + max_code_per_seg
+        if tentative_end >= total_tokens:
+            # 剩下的 token 全部放进这一段
+            end_idx = total_tokens
+        else:
+            # tentative_end 指向的是“假想的最后一个 token 的下标”（半开区间左闭右开，所以要减 1）
+            last_token_idx = tentative_end - 1
+            last_row = row_idx[last_token_idx]
+
+            # 在 [start_idx, total_tokens) 范围内，找到 last_row 首次出现的位置，
+            # 也就是该行的第一个 token，把它挪到下一段。
+            try:
+                first_pos_of_last_row = row_idx.index(last_row, start_idx)
+            except ValueError:
+                # 理论上不会发生，保险起见
+                first_pos_of_last_row = last_token_idx
+
+            end_idx = first_pos_of_last_row
+
+            # 极端情况：某一行 token 数本身就 > max_code_per_seg，
+            # 会导致 end_idx == start_idx，一直卡死。
+            # 这种情况下，只能“破例”在行内截断一次（非常少见）。
+            if end_idx == start_idx:
+                end_idx = min(start_idx + max_code_per_seg, total_tokens)
+
+        # 防御：如果还是没有前进，就 break 避免死循环
+        if end_idx <= start_idx:
+            break
+
+        # 构造这一段的 token & line_ids
+        bos = tokenizer.cls_token or tokenizer.bos_token or tokenizer.pad_token
+        eos = tokenizer.sep_token or tokenizer.eos_token or tokenizer.pad_token
+        seg_tokens = [bos] + code_tokens[start_idx:end_idx] + [eos]
+        seg_line_ids = [0] + row_idx[start_idx:end_idx] + [0]
+
+        input_ids = tokenizer.convert_tokens_to_ids(seg_tokens)
+
+        # padding / 截断到 block_size
+        if len(input_ids) < block_size:
+            pad_len = block_size - len(input_ids)
+            input_ids += [pad_id] * pad_len
+            seg_line_ids += [0] * pad_len
+        else:
+            input_ids = input_ids[:block_size]
+            seg_line_ids = seg_line_ids[:block_size]
+
+        seg_input_ids_list.append(input_ids)
+        seg_line_ids_list.append(seg_line_ids)
+
+        # 下一段从 end_idx 开始
+        start_idx = end_idx
+
+        # 总 token 超过 seg_num 能容纳的范围，就截断掉后面的（按段截）
+        if start_idx >= total_tokens:
+            break
+
+    return seg_input_ids_list, seg_line_ids_list, num_lines
+def build_line_graph_for_func_multi_segment(
+    seg_input_ids_list,
+    seg_line_ids_list,
+    tokenizer,
+    word_embeddings,
+    window_size=3,
+    same_name_weight=3.0,
+    weighted_graph=True,
+    # ===== Ablation 开关 =====
+    use_A1=True,
+    use_A2=True,
+    use_A3=True,
+    # ===== A3 降噪超参 =====
+    ident_min_len=2,
+    ident_max_occ=8,
+    ident_max_line_gap=200,
+    # ===== NEW: A1 only-valid =====
+    valid_mask=None,  # List[bool]，长度≈原始行数；函数内部会对齐到 num_lines
+):
+    """
+    改动点：
+    - A1：只在有效行之间连边，连接“下一个有效行”而不是 i->i+1/i+2
+    - A2：仅用信息量 token 参与共现；并把边权按窗口数归一化，避免长函数边权爆炸
+    """
+    assert len(seg_input_ids_list) == len(seg_line_ids_list)
+    if isinstance(word_embeddings, torch.Tensor):
+        word_embeddings = word_embeddings.detach().cpu().numpy()
+    hidden_dim = word_embeddings.shape[1]
+
+    # ===== 推 num_lines =====
+    max_line = 1
+    for line_ids in seg_line_ids_list:
+        for lid in line_ids:
+            if lid > 0:
+                max_line = max(max_line, lid)
+    num_lines = max_line
+
+    # ===== 对齐 valid_mask 到 num_lines（如果提供）=====
+    if valid_mask is not None:
+        if len(valid_mask) > num_lines:
+            valid_mask = valid_mask[:num_lines]
+        elif len(valid_mask) < num_lines:
+            valid_mask = valid_mask + [True] * (num_lines - len(valid_mask))
+        valid_mask_arr = np.array(valid_mask, dtype=bool)
+    else:
+        valid_mask_arr = np.ones(num_lines, dtype=bool)
+
+    line_seg_ids = np.full(num_lines, -1, dtype=np.int64)
+
+    # ===== 行特征累积（max pooling）=====
+    line_feats = np.full((num_lines, hidden_dim), -1e9, dtype=np.float32)
+    line_has_token = np.zeros(num_lines, dtype=bool)
+
+    edge_weight = defaultdict(float)
+    pad_ids = {tokenizer.pad_token_id, 1, 2}  # 兼容 RoBERTa: <pad>=1, </s>=2
+
+    # ===== A2 信息量 token 过滤：仅保留“像标识符”的 token（强过滤，先稳为主）=====
+    def is_informative_token(tok_str: str) -> bool:
+        if tok_str is None:
+            return False
+        t = clean_roberta_token(tok_str).strip()
+        if len(t) == 0:
+            return False
+        # 必须含字母/数字/_（过滤纯符号）
+        if not any(ch.isalnum() or ch == "_" for ch in t):
+            return False
+        # 过滤关键词、低信息标识符
+        tl = t.lower()
+        if tl in KEYWORDS:
+            return False
+        if tl in LOW_INFO_IDENTIFIERS:
+            return False
+        # 过滤太短的碎片（可按需调大/调小）
+        if len(t) < 2:
+            return False
+        # 更严格：像标识符（首字符字母或下划线）
+        if len(t) < 3:
+            return False
+        return True
+
+    # ===== 每个 segment 内部构边（A2/A3）=====
+    for seg_idx, (seg_input_ids, seg_line_ids) in enumerate(zip(seg_input_ids_list, seg_line_ids_list)):
+        assert len(seg_input_ids) == len(seg_line_ids)
+
+        # 1) 去掉尾部 PAD/</s>
+        end = len(seg_input_ids)
+        while end > 0 and seg_input_ids[end - 1] in pad_ids:
+            end -= 1
+        token_ids = seg_input_ids[:end]
+        line_ids = seg_line_ids[:end]
+
+        # ------------------------------------------------------------
+        # (I) token_line_idx + 行特征
+        # ------------------------------------------------------------
+        token_line_idx = [-1] * len(line_ids)
+        for pos, lid in enumerate(line_ids):
+            if lid <= 0:
+                continue
+            idx0 = lid - 1
+            token_line_idx[pos] = idx0
+
+            emb = word_embeddings[int(token_ids[pos])]
+
+            if not line_has_token[idx0]:
+                line_feats[idx0] = emb
+                line_has_token[idx0] = True
+            else:
+                line_feats[idx0] = np.maximum(line_feats[idx0], emb)
+
+            if line_seg_ids[idx0] < 0:
+                line_seg_ids[idx0] = seg_idx
+
+        assert len(token_line_idx) == len(token_ids), \
+            f"len(token_line_idx)={len(token_line_idx)} != len(token_ids)={len(token_ids)}"
+
+        # ------------------------------------------------------------
+        # (II) A2：token 共现窗口 -> 行边（信息量 token + 归一化权重）
+        # ------------------------------------------------------------
+        if use_A2:
+            T = len(token_ids)
+            if T > 0:
+                tokens_str = tokenizer.convert_ids_to_tokens(token_ids)
+
+                # 仅保留“词首”token（Ġ 开头）作为信息 token（减少 BPE 碎片噪声）
+                info_mask = [False] * T
+                for pos, tok in enumerate(tokens_str):
+                    li = token_line_idx[pos]
+                    if li < 0:
+                        continue
+                    # 行无效，直接不参与 A2
+                    if not valid_mask_arr[li]:
+                        continue
+
+                    # 强过滤：只保留“词首”token（Roberta/UniXcoder 常见 Ġ）
+                    # 如果你用的是不带 Ġ 的 tokenizer，可把这一行注释掉
+                    if (not tok.startswith("Ġ")) and (tok not in ["<s>", "</s>", "<pad>"]):
+                        continue
+
+                    if is_informative_token(tok):
+                        info_mask[pos] = True
+
+                # windows
+                if T <= window_size:
+                    windows = [list(range(T))]
+                else:
+                    windows = [list(range(i, i + window_size)) for i in range(T - window_size + 1)]
+
+                # 归一化：按窗口数归一，避免长函数边权爆炸
+                num_windows = max(1, len(windows))
+                w_norm = 1.0 / float(num_windows)
+
+                for win in windows:
+                    # 只考虑 info token
+                    info_pos = [p for p in win if info_mask[p]]
+                    if len(info_pos) <= 1:
+                        continue
+
+                    # NEW: 窗口内对“行对”去重，避免同一窗口重复累加同一行对
+                    seen_pairs = set()
+
+                    for ii in range(1, len(info_pos)):
+                        for jj in range(0, ii):
+                            pi = info_pos[ii]
+                            pj = info_pos[jj]
+                            li = token_line_idx[pi]
+                            lj = token_line_idx[pj]
+                            if li < 0 or lj < 0 or li == lj:
+                                continue
+                            # 两端行都必须有效
+                            if (not valid_mask_arr[li]) or (not valid_mask_arr[lj]):
+                                continue
+
+                            # 归一化去重 key（无向对）
+                            a, b = (li, lj) if li < lj else (lj, li)
+                            if (a, b) in seen_pairs:
+                                continue
+                            seen_pairs.add((a, b))
+
+                            edge_weight[(li, lj)] += w_norm
+                            edge_weight[(lj, li)] += w_norm
+
+        # ------------------------------------------------------------
+        # (III) A3：identifier 同名边（保持你原逻辑）
+        # ------------------------------------------------------------
+        if use_A3:
+            tokens_str = tokenizer.convert_ids_to_tokens(token_ids)
+
+            id2lines = defaultdict(set)
+            cur = ""
+            cur_line = -1
+
+            for pos, tok in enumerate(tokens_str):
+                li = token_line_idx[pos]
+                if li < 0:
+                    if is_identifier_like(cur) and cur_line >= 0:
+                        id2lines[cur].add(cur_line)
+                    cur = ""
+                    cur_line = -1
+                    continue
+
+                # 行无效：不参与 A3（避免跨无效行桥接）
+                if not valid_mask_arr[li]:
+                    if is_identifier_like(cur) and cur_line >= 0:
+                        id2lines[cur].add(cur_line)
+                    cur = ""
+                    cur_line = li
+                    continue
+
+                t = clean_roberta_token(tok)
+
+                if len(t) == 0 or (not any(ch.isalnum() or ch == "_" for ch in t)):
+                    if is_identifier_like(cur) and cur_line >= 0:
+                        id2lines[cur].add(cur_line)
+                    cur = ""
+                    cur_line = li
+                    continue
+
+                is_new_word = tok.startswith("Ġ")
+
+                if li != cur_line:
+                    if is_identifier_like(cur) and cur_line >= 0:
+                        id2lines[cur].add(cur_line)
+                    cur = t
+                    cur_line = li
+                    continue
+
+                if is_new_word:
+                    if is_identifier_like(cur) and cur_line >= 0:
+                        id2lines[cur].add(cur_line)
+                    cur = t
+                else:
+                    cur = cur + t
+
+            if is_identifier_like(cur) and cur_line >= 0:
+                id2lines[cur].add(cur_line)
+
+            for ident, lines_set in id2lines.items():
+                ident_lower = ident.lower()
+                if ident_lower in LOW_INFO_IDENTIFIERS:
+                    continue
+                if len(ident) < ident_min_len:
+                    continue
+                if len(lines_set) <= 1:
+                    continue
+                if ident_max_occ is not None and len(lines_set) > ident_max_occ:
+                    continue
+
+                lines = sorted(lines_set)
+                w = float(same_name_weight) / (len(lines) ** 0.5)
+
+                for a in range(len(lines)):
+                    for b in range(a + 1, len(lines)):
+                        la, lb = lines[a], lines[b]
+                        if ident_max_line_gap is not None and abs(la - lb) > ident_max_line_gap:
+                            continue
+                        edge_weight[(la, lb)] += w
+                        edge_weight[(lb, la)] += w
+
+    # ===== 行特征/seg 防御处理 =====
+    line_feats[~line_has_token] = 0.0
+    line_seg_ids[line_seg_ids < 0] = 0
+
+    # ------------------------------------------------------------
+    # (IV) A1：只在“有效行序列”之间连边（next-valid）
+    # ------------------------------------------------------------
+    if use_A1:
+        # 有效标准：valid_mask=True 且该行有 token（避免空节点参与传播）
+        eff_valid = (valid_mask_arr & line_has_token)
+        valid_lines = np.where(eff_valid)[0].tolist()
+        for k in range(len(valid_lines) - 1):
+            i = valid_lines[k]
+            j = valid_lines[k + 1]
+            # 只连“下一个有效行”
+            edge_weight[(i, j)] += 1.0
+            edge_weight[(j, i)] += 1.0
+
+    # ===== 邻接矩阵 =====
+    rows, cols, vals = [], [], []
+    for (u, v), w in edge_weight.items():
+        rows.append(u)
+        cols.append(v)
+        vals.append(float(w if weighted_graph else 1.0))
+
+    if len(rows) == 0:
+        adj = sp.csr_matrix((num_lines, num_lines), dtype=np.float32)
+    else:
+        adj = sp.csr_matrix((vals, (rows, cols)), shape=(num_lines, num_lines), dtype=np.float32)
+
+    return adj, line_feats, num_lines, line_seg_ids
 
 
 
@@ -363,21 +878,39 @@ def build_graphs_from_csv(
     tokenizer,
     emb_matrix,
     max_len=512,
+    seg_num=4,
     window_size=3,
     same_name_weight=3.0,
     device=None,
     num_workers=None,
     use_cache=True,
+    # ===== 新增：Ablation 开关 =====
+    use_A1=True,
+    use_A2=True,
+    use_A3=True,
+    weighted_graph=True,
+    cache_tag="",     
 ):
     """
-    单进程构图 + 可选缓存：
-      - use_cache=True：优先读取/写入 .graphs.pt 缓存
-    emb_matrix: 只用来查表，不跑 encoder。
+    基于多段切分的构图：
+      - 每个函数按 block_size=max_len 切成至多 seg_num 段
+      - 所有段在行级合并成一张图
+      - 行标签仍基于原始 processed_func 的全局行号（0-based flaw_line_index）
+
+    注意：缓存文件会变（增加 seg_num 维度），建议删旧 .graphs.pt 重新生成。
     """
-    cache_path = csv_path + ".graphs.pt"
+    import re
+    safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", cache_tag) if cache_tag else "default"
+
+    cache_path = csv_path + (
+        f".{safe_tag}"
+        f".seg{seg_num}_bs{max_len}"
+        f".A1{int(use_A1)}A2{int(use_A2)}A3{int(use_A3)}"
+        f".w{int(weighted_graph)}"
+        f".graphs.pt"
+    )
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
 
-    # 1) 有缓存 & 开启 use_cache，就直接读
     if use_cache and os.path.exists(cache_path):
         print(f"[build_graphs_from_csv] load cached graphs from {cache_path}")
         graphs = torch.load(cache_path, map_location="cpu")
@@ -395,62 +928,65 @@ def build_graphs_from_csv(
     targets = df["target"].astype(int).tolist()
     flaw_strs = df["flaw_line_index"].tolist()
 
-    # 2) 函数 -> token_ids / line_ids
-    doc_token_ids_list = []
-    doc_line_ids_list = []
-    num_lines_list = []
-
-    for func in tqdm(funcs, total=len(funcs),
-                     desc=f"Tokenizing & line-id mapping ({os.path.basename(csv_path)})"):
-        input_ids, line_ids, num_lines = tokenize_func_with_line_ids(
-            func, tokenizer, max_len=max_len
-        )
-        doc_token_ids_list.append(input_ids)
-        doc_line_ids_list.append(line_ids)
-        num_lines_list.append(num_lines)
-
-    # 3) 用 embedding 矩阵直接查表构建行特征 + 邻接
-    x_adj_list, x_feat_list, line_nums = build_line_graph_with_embedding(
-        doc_token_ids_list,
-        doc_line_ids_list,
-        emb_matrix,
-        tokenizer=tokenizer,
-        window_size=window_size,
-        same_name_weight=same_name_weight,
-    )
-
     graphs = []
-    for i in tqdm(range(len(funcs)), total=len(funcs),
-                  desc=f"Building PyG Data ({os.path.basename(csv_path)})"):
-        adj = x_adj_list[i]
-        feat = x_feat_list[i]        # [num_lines_eff, hidden_dim]
-        num_lines = line_nums[i]
 
+    for i, func in enumerate(tqdm(funcs, total=len(funcs),
+                                desc=f"Tokenize+build-graph ({os.path.basename(csv_path)})")):
         y_func = targets[i]
         code_str = funcs[i]
         flaw_str = flaw_strs[i]
 
-        # =============== 行过滤 mask（仅代码行保留） ===============
-        valid_mask = get_valid_line_mask_from_processed_func(code_str)
+        # 0) 先算 valid_mask（基于原始 processed_func 的行）
+        valid_mask_pre = get_valid_line_mask_from_processed_func(code_str)
 
-        # 和 tokenize 的行数对齐一下（通常会相等）
-        if len(valid_mask) != num_lines:
-            if len(valid_mask) > num_lines:
-                valid_mask = valid_mask[:num_lines]
-            else:
-                valid_mask = valid_mask + [True] * (num_lines - len(valid_mask))
+        # 1) 分段（注意：strip_comments_keep_lines 保持行数不变）
+        clean_func = strip_comments_keep_lines(code_str)
+        seg_input_ids_list, seg_line_ids_list, num_lines_src = tokenize_func_into_segments(
+            clean_func,
+            tokenizer,
+            block_size=max_len,
+            seg_num=seg_num,
+        )
 
-        # ====== 根据 y_func + flaw_line_index 决定行级标签 ======
+        # 2) 构建行图（把 valid_mask_pre 传进去给 A1/A2/A3 用）
+        adj, feat, num_lines_eff, line_seg_ids = build_line_graph_for_func_multi_segment(
+            seg_input_ids_list,
+            seg_line_ids_list,
+            tokenizer=tokenizer,
+            word_embeddings=emb_matrix,
+            window_size=window_size,
+            same_name_weight=same_name_weight,
+            weighted_graph=weighted_graph,
+            use_A1=use_A1,
+            use_A2=use_A2,
+            use_A3=use_A3,
+            valid_mask=valid_mask_pre,  # NEW
+        )
+
+        num_lines_graph = feat.shape[0]
+
+        # 3) 对齐 valid_mask 到 num_lines_graph（你原来的逻辑保留）
+        valid_mask = valid_mask_pre
+        if len(valid_mask) > num_lines_graph:
+            valid_mask = valid_mask[:num_lines_graph]
+        elif len(valid_mask) < num_lines_graph:
+            valid_mask = valid_mask + [True] * (num_lines_graph - len(valid_mask))
+
+        # 4) 行级标签（你原来的逻辑保留）
         if y_func == 1 and is_empty_flaw(flaw_str):
-            # ⭐ 函数级为 vul，但缺失行级标注 -> 行级全部未知（-1）
-            y_line_list = [-1] * num_lines
+            y_line_list = [-1] * num_lines_graph
         else:
-            # 正常情况：用 flaw_line_index + valid_mask 打 0/1/-1
             y_line_list = parse_flaw_line_index(
                 flaw_str,
-                num_lines,
+                num_lines_graph,
                 valid_mask=valid_mask
             )
+
+        # 保险：再对齐一次长度
+        if len(y_line_list) > num_lines_graph:
+            y_line_list = y_line_list[:num_lines_graph]
+        elif len(y_line_list) < num_lines_graph:
+            y_line_list = y_line_list + [-1] * (num_lines_graph - len(y_line_list))
 
         y_line = torch.tensor(y_line_list, dtype=torch.long)
 
@@ -463,8 +999,14 @@ def build_graphs_from_csv(
             edge_attr=edge_weight,
             y_func=torch.tensor(y_func, dtype=torch.long),
             y_line=y_line,
-            num_lines=num_lines,
+            num_lines=num_lines_graph,  # ✅ 这里也改成图里的行数
+            seg_id=torch.tensor(line_seg_ids, dtype=torch.long),
         )
+
+        # 调试期加个 assert，防止以后再崩同类问题
+        assert data.x.size(0) == data.y_line.size(0) == data.seg_id.size(0), \
+            f"graph {i}: x={data.x.size(0)}, y_line={data.y_line.size(0)}, seg_id={data.seg_id.size(0)}"
+
         graphs.append(data)
 
     # 4) 缓存
@@ -474,71 +1016,4 @@ def build_graphs_from_csv(
     else:
         print("[build_graphs_from_csv] use_cache=False, 不保存缓存图。")
     return graphs
-
-
-def build_line_graph_with_embedding(
-    doc_token_ids_list,
-    doc_line_ids_list,
-    emb_matrix,
-    tokenizer,
-    window_size=3,
-    same_name_weight=3.0,
-    weighted_graph=True,
-):
-    """
-    基于【embedding 查表】的行级图构建（批量版）。
-
-    参数：
-        doc_token_ids_list : List[List[int]]
-            每个函数的 input_ids（含 [CLS]/[SEP]/[PAD]）
-        doc_line_ids_list  : List[List[int]]
-            每个函数的 line_ids（0 / 1..num_lines）
-        emb_matrix         : np.ndarray 或 torch.Tensor
-            GraphCodeBERT 的 word_embeddings.weight（已转成 numpy 最好）
-        tokenizer          : GraphCodeBERT 的 tokenizer
-        window_size        : 共现滑动窗口大小（token 层）
-        same_name_weight   : 同名 token 行之间边的权重加成
-        weighted_graph     : True 使用频数权重，False 所有边权重=1
-
-    返回：
-        x_adj_list   : List[scipy.sparse.csr_matrix]，每个函数一张 (num_lines, num_lines) 邻接
-        x_feat_list  : List[np.ndarray]，每个函数一份 (num_lines, hidden_dim) 行特征
-        line_nums    : List[int]，每个函数的行数
-    """
-    assert len(doc_token_ids_list) == len(doc_line_ids_list)
-
-    # 如果传进来的是 torch.Tensor，先转成 numpy，避免反复 .cpu().numpy()
-    if isinstance(emb_matrix, torch.Tensor):
-        word_embeddings = emb_matrix.detach().cpu().numpy()
-    else:
-        word_embeddings = emb_matrix
-
-    x_adj_list = []
-    x_feat_list = []
-    line_nums = []
-
-    for i in tqdm(range(len(doc_token_ids_list)),
-                  total=len(doc_token_ids_list),
-                  desc="Building line-graphs with embedding"):
-        token_ids = doc_token_ids_list[i]
-        line_ids = doc_line_ids_list[i]
-
-        adj, feats, num_lines = build_line_graph_for_one(
-            token_ids=token_ids,
-            line_ids=line_ids,
-            tokenizer=tokenizer,
-            word_embeddings=word_embeddings,
-            window_size=window_size,
-            same_name_weight=same_name_weight,
-            weighted_graph=weighted_graph,
-        )
-
-        x_adj_list.append(adj)
-        x_feat_list.append(feats)
-        line_nums.append(num_lines)
-
-    return x_adj_list, x_feat_list, line_nums
-
-
-
 
