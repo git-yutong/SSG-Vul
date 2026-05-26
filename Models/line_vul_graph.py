@@ -1,4 +1,4 @@
-# This is Stagedmodel_line_vul_graph.py
+# This is line_vul_graph.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
