@@ -1,4 +1,4 @@
-# this is Stagedbert_line_vul_graph.py
+# this is line_vul_graph.py
 from __future__ import absolute_import, division, print_function
 
 # ===== 标准库 =====
@@ -47,6 +47,84 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from sklearn.metrics import precision_recall_curve
+
+@torch.no_grad()
+def search_best_line_threshold_on_val(
+    args,
+    model,
+    loader,
+    metric="iou",
+    t_min=0.0,
+    t_max=1.0,
+    num_steps=101,
+):
+    """
+    在 val 上搜索行级阈值 t_line。
+    默认：最大化 IoU（只在 y_func==1 的函数上统计，口径与 evaluate/evaluate_on_test 一致）。
+    返回：best_t_line, meta
+    """
+    device = args.device
+    model.eval()
+
+    thresholds = np.linspace(t_min, t_max, num_steps, dtype=np.float32)
+
+    # 累积每个阈值下的 IoU 总和与计数
+    iou_sum = np.zeros_like(thresholds, dtype=np.float64)
+    iou_cnt = np.zeros_like(thresholds, dtype=np.int64)
+
+    for batch in loader:
+        batch = batch.to(device)
+        logits_func, logits_line = model(batch)
+
+        batch_index = batch.batch.detach().cpu().numpy()  # [N_nodes]
+        y_func_batch = batch.y_func.detach().cpu().numpy().astype(int)  # [B]
+
+        line_prob = torch.softmax(logits_line, dim=-1)[:, 1].detach().cpu().numpy()  # [N_nodes]
+        line_labels_np = batch.y_line.view(-1).detach().cpu().numpy().astype(int)   # [N_nodes]
+
+        num_graphs = y_func_batch.shape[0]
+        for g in range(num_graphs):
+            if int(y_func_batch[g]) != 1:
+                continue
+
+            mask = (batch_index == g)
+            if not np.any(mask):
+                continue
+
+            score_g = line_prob[mask]     # [n_g]
+            true_g  = line_labels_np[mask]# [n_g]
+
+            # 向量化：对每个阈值计算 pred
+            # pred_mat: [T, n_g]
+            pred_mat = (score_g[None, :] > thresholds[:, None]).astype(np.int32)
+
+            true_mat = (true_g[None, :] == 1).astype(np.int32)
+
+            inter = (pred_mat & true_mat).sum(axis=1)  # [T]
+            union = ((pred_mat == 1) | (true_mat == 1)).sum(axis=1)  # [T]
+
+            # union==0 -> IoU=1
+            iou = np.where(union > 0, inter / (union + 1e-12), 1.0)
+
+            iou_sum += iou
+            iou_cnt += 1
+
+    avg_iou = np.where(iou_cnt > 0, iou_sum / iou_cnt, 0.0)
+
+    best_idx = int(np.argmax(avg_iou))
+    best_t = float(thresholds[best_idx])
+    best_score = float(avg_iou[best_idx])
+
+    meta = {
+        "metric": metric,
+        "best_iou": best_score,
+        "num_funcs_used": int(iou_cnt[0]) if len(iou_cnt) > 0 else 0,
+        "search_grid": int(num_steps),
+        "t_range": [float(t_min), float(t_max)],
+    }
+    logger.info(f"[VAL line threshold search] best_t_line={best_t:.4f}, best_iou={best_score:.4f}, meta={meta}")
+    return best_t, meta
+
 
 @torch.no_grad()
 def search_best_func_threshold_on_val(args, model, loader, metric="f1"):
@@ -178,12 +256,11 @@ def evaluate_on_test(args, model, loader, split_name="test", func_threshold=0.5,
             k10_percent = max(1, math.ceil(0.10 * n_lines))
             top10p_idx = order0[:k10_percent]
 
-            # 只有函数级 TP（真实 y_func=1 且 预测=1）才计入 percent 分母
-            if int(func_pred_batch[g]) == 1:
-                num_vul_tp_for_percent += 1
-                if np.any(true_g[top5p_idx] == 1):
-                    top5_percent_hits += 1
-                if np.any(true_g[top10p_idx] == 1):
+        
+            num_vul_tp_for_percent += 1
+            if np.any(true_g[top5p_idx] == 1):
+                top5_percent_hits += 1
+            if np.any(true_g[top10p_idx] == 1):
                     top10_percent_hits += 1
 
             # abs top-k
@@ -472,15 +549,14 @@ def evaluate(args, model, loader, split_name="eval", best_threshold=0.5):
             k10_percent = max(1, math.ceil(0.10 * n_lines))
             top10p_idx = order0[:k10_percent]
 
-            # 只有函数级 TP（y_func=1 且 y_pred=1）的函数才计入 top_5% / top_10%
-            if int(func_pred_batch[g]) == 1:
-                num_vul_tp_for_percent += 1
+            # 所有 y_func == 1 的函数都参与 Top-k% 计算（无论函数级预测是否正确）
+            num_vul_tp_for_percent += 1  
+            if np.any(true_g[top5p_idx] == 1):
+                top5_percent_hits += 1
+            if np.any(true_g[top10p_idx] == 1):
+                top10_percent_hits += 1
 
-                if np.any(true_g[top5p_idx] == 1):
-                    top5_percent_hits += 1
 
-                if np.any(true_g[top10p_idx] == 1):
-                    top10_percent_hits += 1
 
             # ---------- 行数版：Top-1 / 3 / 5 / 10 ----------
             k1 = min(1, n_lines)
@@ -635,10 +711,10 @@ def main():
 
     parser.add_argument('--seed', type=int, default=12345,
                         help="random seed for initialization")
-    parser.add_argument('--epochs', type=int, default=120,
+    parser.add_argument('--epochs', type=int, default=70,
                         help="training epochs")
     
-    parser.add_argument("--early_stop_number", type=int, default=25,
+    parser.add_argument("--early_stop_number", type=int, default=40,
                         help="If >0, stop training when eval_f1 does not improve for N consecutive epochs.")
     parser.add_argument("--num_workers", type=int, default=16,
                     help="DataLoader num_workers.")
@@ -651,12 +727,13 @@ def main():
                         help="Use A2 token co-occurrence edges (1=yes, 0=no).")
     parser.add_argument("--use_A3", type=int, default=0,
                         help="Use A3 identifier same-name edges (1=yes, 0=no).")
-
     parser.add_argument("--gpu_id",type=int,default=0,
                         help="GPU id to use. -1 for CPU, 0 for cuda:0, 1 for cuda:1, etc.")
-
+    parser.add_argument("--line_pooling",type=str,default="mean",choices=["mean", "max","weight"],
+    help="Pooling method for aggregating token embeddings into line embeddings."
+)
     args = parser.parse_args()
-    model_tag = args.pretrained_model.split("/")[-1]
+
 
     # Setup CUDA, GPU
     if args.gpu_id == -1:
@@ -670,6 +747,9 @@ def main():
 
     elif args.gpu_id == 2:
         device = torch.device("cuda:2")
+
+    elif args.gpu_id == 3:
+        device = torch.device("cuda:3")
 
     else:
         device = torch.device("cpu")
@@ -698,41 +778,14 @@ def main():
     exp_tag = f"A1{args.use_A1}_A2{args.use_A2}_A3{args.use_A3}"
     logger.info(f"Graph ablation setting: {exp_tag}")
 
-    from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.pretrained_model,
-        trust_remote_code=True,     
-        use_fast=True
-    )
-
-    try:
-        base_model = AutoModelForCausalLM.from_pretrained(
-            args.pretrained_model,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-    except Exception:
-        base_model = AutoModel.from_pretrained(
-            args.pretrained_model,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True
-        )
-
-    # 关键：确保 pad_token 可用（很多 CausalLM tokenizer 没有 pad）
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token is not None:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.add_special_tokens({"pad_token": "<pad>"})
-            base_model.resize_token_embeddings(len(tokenizer))
-
-    word_embeddings = base_model.get_input_embeddings().weight.detach().cpu().numpy()
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
+    base_model = AutoModel.from_pretrained(args.pretrained_model)
+    word_embeddings = base_model.get_input_embeddings().weight.data.cpu().numpy()
     hidden_dim = word_embeddings.shape[1]
     del base_model
     torch.cuda.empty_cache()
 
-    build_num_workers=None
+    build_num_workers = None
     train_graphs = build_graphs_from_csv(
         args.train_data_file,
         tokenizer,
@@ -746,7 +799,7 @@ def main():
         use_A1=bool(args.use_A1),
         use_A2=bool(args.use_A2),
         use_A3=bool(args.use_A3),
-        cache_tag=model_tag, 
+        line_pooling=args.line_pooling
     ) if args.do_train else []
 
     eval_graphs = build_graphs_from_csv(
@@ -762,7 +815,7 @@ def main():
         use_A1=bool(args.use_A1),
         use_A2=bool(args.use_A2),
         use_A3=bool(args.use_A3),
-        cache_tag=model_tag, 
+        line_pooling=args.line_pooling
     ) if args.do_train and args.evaluate_during_training else []
 
     test_graphs = build_graphs_from_csv(
@@ -778,10 +831,8 @@ def main():
         use_A1=bool(args.use_A1),
         use_A2=bool(args.use_A2),
         use_A3=bool(args.use_A3),
-        cache_tag=model_tag, 
+        line_pooling=args.line_pooling
     ) if args.do_test else []
-
-
 
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -798,7 +849,7 @@ def main():
 
     eval_loader = PyGDataLoader(
         eval_graphs,
-        # test_graphs,  
+        # test_graphs,
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -817,9 +868,6 @@ def main():
         generator=g,
     ) if test_graphs else None
 
-
-
-
     # ===== 计算训练集正负比例，自动生成 focal beta =====
     num_pos = sum([int(g.y_func.item() == 1) for g in train_graphs])
     num_neg = len(train_graphs) - num_pos
@@ -829,8 +877,6 @@ def main():
     beta = min(5.0, max(1.0, raw_beta))
     logger.info(f"Focal beta (auto): {beta:.4f}   (pos_ratio={pos_ratio:.4f})")
     args.focal_beta = beta
-
-
 
     # === 3) 模型输入维度，用图里的 x 自动推 ===
     in_dim = train_graphs[0].x.size(-1) if train_graphs else hidden_dim
@@ -852,7 +898,6 @@ def main():
     )
     scheduler = None
 
-
     if args.do_train and len(train_loader) > 0:
         # 每个 epoch 的 “更新步数”（考虑梯度累积）
         steps_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
@@ -870,8 +915,13 @@ def main():
     best_f1 = 0.0
     best_ckpt = os.path.join(run_dir, "checkpoint-best-func_f1.pt")
 
+    # >>> 新增：用于保存 Top_10%_accuracy 最高且 F1 >= F1_GATE 的模型 <<<
+    F1_GATE = 0.90
+    best_top10_acc_under_f1_constraint = -1.0
+    best_ckpt_top10 = os.path.join(run_dir, "checkpoint-best-top10_acc_under_f1.pt")
 
-    no_improve_epochs = 0
+    # ====== 早停（按 eval_f1，不被 Top10 保存逻辑干扰）======
+    no_improve_f1_epochs = 0
 
     global_best_t = 0.5
     fixed_threshold = 0.1
@@ -899,10 +949,10 @@ def main():
                 batch = batch.to(device)
                 logits_func, logits_line = model(batch)
                 loss, loss_func, loss_line = compute_loss(
-                        logits_func, logits_line, batch,
-                        alpha=args.line_loss_weight,
-                        beta=args.focal_beta,
-                    )
+                    logits_func, logits_line, batch,
+                    alpha=args.line_loss_weight,
+                    beta=args.focal_beta,
+                )
 
                 if args.n_gpu > 1:
                     loss = loss.mean()
@@ -928,61 +978,101 @@ def main():
 
             avg_loss = epoch_loss / max(1, tr_nb)
             logger.info(f"Epoch {epoch} finished. train_loss={avg_loss:.5f}")
-            
+
             if args.evaluate_during_training and eval_loader is not None:
-                # 使用固定行级阈值 0.1
+                # 使用固定行级阈值 0.1（只影响 IoU，不影响 top-k% 排序指标）
                 eval_result = evaluate(
                     args, model, eval_loader,
                     split_name="eval", best_threshold=fixed_threshold
                 )
 
                 func_f1 = eval_result["eval_f1"]
-                # ====== 早停逻辑 ======
+
+                # ====== 按 eval_f1 保存 best_ckpt ======
                 if func_f1 > best_f1:
                     best_f1 = func_f1
-                    no_improve_epochs = 0
+                    no_improve_f1_epochs = 0
                     torch.save(model.state_dict(), best_ckpt)
                     logger.info(f"New best eval_f1={best_f1:.4f}, saved to {best_ckpt}")
                 else:
-                    no_improve_epochs += 1
-                    if args.early_stop_number > 0 and no_improve_epochs >= args.early_stop_number:
-                        logger.info(
-                            f"Early stopping triggered: no improvement in eval_f1 for "
-                            f"{args.early_stop_number} consecutive epochs."
-                        )
-                        break
+                    no_improve_f1_epochs += 1
+
+                # ====== 保存 Top_10%_accuracy 最高且 F1 >= F1_GATE 的模型 ======
+                # 若 top10% 更高 -> 保存
+                # 若 top10% 相等，但 F1 更高 -> 也保存 仍然要求 F1 >= F1_GATE 才进入该逻辑
+                current_top10_acc = eval_result["top_10%_accuracy"]
+                if func_f1 >= F1_GATE and (
+                    (current_top10_acc > best_top10_acc_under_f1_constraint) or
+                    (current_top10_acc == best_top10_acc_under_f1_constraint and func_f1 > best_f1_under_top10_constraint)
+                ):
+                    best_top10_acc_under_f1_constraint = current_top10_acc
+                    best_f1_under_top10_constraint = func_f1
+                    torch.save(model.state_dict(), best_ckpt_top10)
+                    logger.info(
+                        f"New best top_10%_accuracy (or tie+better F1) under F1>={F1_GATE:.2f}: "
+                        f"top10_acc={current_top10_acc:.4f}, F1={func_f1:.4f}, "
+                        f"saved to {best_ckpt_top10}"
+                    )
+
+                # ====== 早停判断（按 eval_f1，与日志一致）======
+                if args.early_stop_number > 0 and no_improve_f1_epochs >= args.early_stop_number:
+                    logger.info(
+                        f"Early stopping triggered: no improvement in eval_f1 for "
+                        f"{args.early_stop_number} consecutive epochs."
+                    )
+                    break
 
         # 如果训练期间没有做过验证（evaluate_during_training=False），那就直接把最后一版模型保存一下
         if not args.evaluate_during_training:
             torch.save(model.state_dict(), best_ckpt)
             logger.info(f"Training finished without eval, saving final model to {best_ckpt}")
 
-
     if args.do_test and test_loader is not None:
         logger.info("======= Testing =======")
 
-        # 1) 先加载 best checkpoint
+        # 1) 先加载 best checkpoint（F1 最优）
         if os.path.exists(best_ckpt):
             model.load_state_dict(torch.load(best_ckpt, map_location=device))
             logger.info(f"Loaded best checkpoint from {best_ckpt}")
         else:
             logger.warning(f"No best checkpoint found at {best_ckpt}, using current model weights.")
 
-        # 2) 用 best_ckpt 在 val 上搜索“函数级阈值”
+        # 2) 用该 checkpoint 在 val 上搜索“函数级阈值”和“行级阈值”
         if eval_loader is not None:
-            best_t_func, meta = search_best_func_threshold_on_val(args, model, eval_loader, metric="f1")
-            logger.info(f"Use best_t_func={best_t_func:.4f} for test evaluation. meta={meta}")
-        else:
-            logger.warning("eval_loader is None, fall back to 0.5 for func threshold.")
-            best_t_func = 0.5
+            best_t_func, meta_f = search_best_func_threshold_on_val(args, model, eval_loader, metric="f1")
+            logger.info(f"Use best_t_func={best_t_func:.4f} for test evaluation. meta={meta_f}")
 
-        # 3) 用该函数级阈值在 test 上 evaluate
+            best_t_line, meta_l = search_best_line_threshold_on_val(
+                args, model, eval_loader,
+                metric="iou",
+                t_min=0.0, t_max=1.0, num_steps=101
+            )
+            logger.info(f"Use best_t_line={best_t_line:.4f} for test evaluation. meta={meta_l}")
+        else:
+            logger.warning("eval_loader is None, fall back to defaults for thresholds.")
+            best_t_func = 0.5
+            best_t_line = fixed_threshold  # 你原来的 0.1
+
+        # 3) 用阈值在 test 上 evaluate（F1 最优 ckpt）
         _ = evaluate_on_test(
             args, model, test_loader,
             split_name="test",
-            func_threshold=best_t_func,      # ★ val 上搜到的函数级阈值
-            line_threshold=fixed_threshold   # 行级阈值仍固定 0.1
+            func_threshold=best_t_func,
+            line_threshold=best_t_line
         )
+
+        # 4) 评估一下 “Top10-under-F1” ckpt（不影响你原逻辑）
+        if os.path.exists(best_ckpt_top10):
+            logger.info("======= Testing (Top10-under-F1 ckpt) =======")
+            model.load_state_dict(torch.load(best_ckpt_top10, map_location=device))
+            _ = evaluate_on_test(
+                args, model, test_loader,
+                split_name="test_top10",
+                func_threshold=best_t_func,
+                line_threshold=best_t_line
+            )
+        else:
+            logger.warning(f"No best top10 checkpoint found at {best_ckpt_top10}, skip test_top10.")
 
 if __name__ == "__main__":
     main()
